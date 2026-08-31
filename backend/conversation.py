@@ -134,9 +134,16 @@ class CallSession:
     # all. Re-detecting per turn would drop the playbook mid-flow, so a new
     # detection replaces this and silence leaves it alone (Sec6E).
     intent: str | None = None
-    # The previous turn's first clause, and how many turns running the model
-    # has opened with it. Drives the repeat breaker - see _is_repeat_opening.
-    last_opening: str = ""
+    # The opening clause of each of the last few spoken turns, and how many
+    # times running the repeat breaker has had to fire. See _is_repeat_opening.
+    #
+    # A window rather than just the previous turn, because one remembered turn
+    # only makes the model ALTERNATE: it says A, gets stopped, says the
+    # recovery line, then says A again - which no longer matches, so it can go
+    # A / recovery / A / recovery for the rest of the call and the caller never
+    # reaches the handoff. Three is enough to catch that and still short enough
+    # that a genuinely new turn clears it.
+    recent_openings: list[str] = field(default_factory=list)
     repeat_count: int = 0
 
     def known_facts(self) -> dict[str, str]:
@@ -480,7 +487,7 @@ class ConversationManager:
             # chunker releases it from flush() once the stream is done, so a
             # guard on the loop alone silently never fires on the only turns it
             # exists for. This function is the one place BOTH paths go through.
-            if not spoken and _is_repeat_opening(clause, session.last_opening):
+            if not spoken and _is_repeat_opening(clause, session.recent_openings):
                 logger.info(
                     "repeat breaker: %s was about to open with %r again", connection_id, clause
                 )
@@ -536,10 +543,9 @@ class ConversationManager:
         if stuck:
             session.repeat_count = min(session.repeat_count + 1, len(_STUCK_REPLIES))
             recovery = _STUCK_REPLIES[session.repeat_count - 1]
-            # Cleared, not set to the recovery line: the recovery lines differ
-            # from each other, so comparing against one would never match, and
-            # the escalation is what the counter is for.
-            session.last_opening = ""
+            # The recovery lines are deliberately NOT remembered: they differ
+            # from each other by design, so they could never match anyway, and
+            # the escalating counter is what ends a hopeless stretch.
             session.messages.append({"role": "assistant", "content": recovery})
             _trim_history(session)
             for clause in split_reply_into_clauses(recovery):
@@ -554,11 +560,13 @@ class ConversationManager:
         # the caller heard, or it will treat a question nobody was asked as
         # already asked and never come back to it.
         session.messages.append({"role": "assistant", "content": spoken_text})
-        # Remember what this turn opened with so the next one can be checked
-        # against it, and forgive the earlier repeats: the counter escalates
-        # only while the model is stuck turn after turn, so one recovered turn
-        # puts a later bad patch back at the gentlest wording.
-        session.last_opening = spoken[0] if spoken else ""
+        # Remember what this turn opened with so later turns can be checked
+        # against it, and forgive the earlier repeats: a turn that got through
+        # means the model is unstuck, so a later bad patch starts again at the
+        # gentlest wording rather than jumping straight to the handoff.
+        if spoken:
+            session.recent_openings.append(spoken[0])
+            del session.recent_openings[:-RECENT_OPENINGS_KEPT]
         session.repeat_count = 0
         _trim_history(session)
         yield AgentTurn(
@@ -618,8 +626,11 @@ _STUCK_REPLIES = (
 _MIN_REPEAT_WORDS = 3
 
 
-def _is_repeat_opening(clause: str, previous: str) -> bool:
-    """Whether this turn is opening with the exact clause the last one did.
+RECENT_OPENINGS_KEPT = 3
+
+
+def _is_repeat_opening(clause: str, recent: list[str]) -> bool:
+    """Whether this turn is opening with a clause a recent turn already used.
 
     Prose cannot hold this. runtime_core.txt has said "Never say a turn you
     have already said" since before the tool removal, and on the real call in
@@ -639,9 +650,7 @@ def _is_repeat_opening(clause: str, previous: str) -> bool:
     reaches the caller and the rest of the generation can be abandoned - which
     makes this a latency win on exactly the turns that were slowest.
     """
-    if not previous or clause != previous:
-        return False
-    return len(clause.split()) >= _MIN_REPEAT_WORDS
+    return len(clause.split()) >= _MIN_REPEAT_WORDS and clause in recent
 
 
 def _append_caller_turn(session: CallSession, text: str) -> None:
