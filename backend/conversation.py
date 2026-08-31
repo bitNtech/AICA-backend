@@ -134,6 +134,10 @@ class CallSession:
     # all. Re-detecting per turn would drop the playbook mid-flow, so a new
     # detection replaces this and silence leaves it alone (Sec6E).
     intent: str | None = None
+    # The previous turn's first clause, and how many turns running the model
+    # has opened with it. Drives the repeat breaker - see _is_repeat_opening.
+    last_opening: str = ""
+    repeat_count: int = 0
 
     def known_facts(self) -> dict[str, str]:
         """Placeholder substitutions for this turn: opening metadata, overlaid
@@ -439,7 +443,7 @@ class ConversationManager:
             session.intent = detected
         session.messages[0]["content"] = self._system_prompt_for(session)
 
-        session.messages.append({"role": "user", "content": text})
+        _append_caller_turn(session, text)
 
         chunker = ClauseChunker()
         spoken: list[str] = []
@@ -469,7 +473,19 @@ class ConversationManager:
             with, deliberately: one definition, so the guard and the eval
             cannot disagree about what a question is.
             """
-            nonlocal asked_question
+            nonlocal asked_question, stuck
+            # The repeat check has to live in here rather than at the feed()
+            # loop, because a one-clause reply - which is the exact shape a
+            # stuck model produces - is never closed by feed() at all. The
+            # chunker releases it from flush() once the stream is done, so a
+            # guard on the loop alone silently never fires on the only turns it
+            # exists for. This function is the one place BOTH paths go through.
+            if not spoken and _is_repeat_opening(clause, session.last_opening):
+                logger.info(
+                    "repeat breaker: %s was about to open with %r again", connection_id, clause
+                )
+                stuck = True
+                return False
             if "?" not in clause:
                 return True
             if asked_question:
@@ -483,9 +499,14 @@ class ConversationManager:
             return True
 
         reply: LlmReply | None = None
-        async for event in llm.stream(
+        # Set by speakable() when this turn opens with the clause the last one
+        # opened with. Declared before the stream so both the feed() loop and
+        # the flush() tail can end the turn on it.
+        stuck = False
+        stream = llm.stream(
             _with_language_reminder(session.messages, self._turn_facts_message(session))
-        ):
+        )
+        async for event in stream:
             if isinstance(event, ReplyComplete):
                 reply = event.reply
                 break
@@ -494,17 +515,37 @@ class ConversationManager:
                     continue
                 spoken.append(clause)
                 yield AgentClause(clause)
+            if stuck:
+                # Nothing of the repeat was spoken and nothing more is worth
+                # generating, so drop the rest of the completion on the floor.
+                await stream.aclose()
+                break
 
-        if reply is None:
+        if reply is None and not stuck:
             raise RuntimeError("LLM stream ended without a ReplyComplete event")
 
         # The chunker never closes a clause on buffer-end (see
         # clause_chunker.py), so the reply's last clause only exists once the
         # stream is done and we ask for it.
-        remainder = chunker.flush()
-        if remainder and speakable(remainder):
-            spoken.append(remainder)
-            yield AgentClause(remainder)
+        if not stuck:
+            remainder = chunker.flush()
+            if remainder and speakable(remainder):
+                spoken.append(remainder)
+                yield AgentClause(remainder)
+
+        if stuck:
+            session.repeat_count = min(session.repeat_count + 1, len(_STUCK_REPLIES))
+            recovery = _STUCK_REPLIES[session.repeat_count - 1]
+            # Cleared, not set to the recovery line: the recovery lines differ
+            # from each other, so comparing against one would never match, and
+            # the escalation is what the counter is for.
+            session.last_opening = ""
+            session.messages.append({"role": "assistant", "content": recovery})
+            _trim_history(session)
+            for clause in split_reply_into_clauses(recovery):
+                yield AgentClause(clause)
+            yield AgentTurn(text=recovery)
+            return
 
         spoken_text = " ".join(spoken)
         # What was SPOKEN, not what was generated - the two differ whenever a
@@ -513,6 +554,12 @@ class ConversationManager:
         # the caller heard, or it will treat a question nobody was asked as
         # already asked and never come back to it.
         session.messages.append({"role": "assistant", "content": spoken_text})
+        # Remember what this turn opened with so the next one can be checked
+        # against it, and forgive the earlier repeats: the counter escalates
+        # only while the model is stuck turn after turn, so one recovered turn
+        # puts a later bad patch back at the gentlest wording.
+        session.last_opening = spoken[0] if spoken else ""
+        session.repeat_count = 0
         _trim_history(session)
         yield AgentTurn(
             text=spoken_text,
@@ -536,6 +583,92 @@ class ConversationManager:
 # ponytail: a flat cap, not summarisation. If calls ever genuinely run past 20
 # exchanges, summarise the dropped span into the facts block instead.
 MAX_HISTORY_MESSAGES = 40
+
+
+def split_reply_into_clauses(text: str) -> list[str]:
+    """One-shot helper: feed a whole reply through ClauseChunker at once.
+
+    The chunker never closes a clause on buffer-end (see clause_chunker.py), so
+    flush() is what releases the final clause of any complete text - feed()
+    alone drops it. Lives here rather than in main.py because the repeat
+    breaker below speaks a canned line and needs the same splitting; main.py
+    imports it for the scripted greeting.
+    """
+    chunker = ClauseChunker()
+    clauses = chunker.feed(text)
+    remainder = chunker.flush()
+    if remainder:
+        clauses.append(remainder)
+    return clauses
+
+
+# What the agent says instead of repeating itself, in order. The first two ask
+# again in fresh words; the third stops asking and hands the call to the desk,
+# so a caller on a line that is not working gets an exit instead of the same
+# sentence until they hang up.
+_STUCK_REPLIES = (
+    "மன்னிச்சுடுங்க சார், clear-ஆ கேட்கல. இன்னொரு தரம் சொல்லுங்களா?",
+    "Line-ல கொஞ்சம் disturbance சார். கொஞ்சம் மெதுவா சொல்லுங்க?",
+    "இன்னும் சரியா கேட்கல சார். Desk-ல இருந்து உங்களுக்கு call பண்ண சொல்றேன். நன்றி சார்.",
+)
+
+# A two-word opening ("சரி சார்.", "நானே சார்,") is an acknowledgement, and two
+# turns running may legitimately start with one. A longer opening repeated
+# verbatim is the model stuck, not the model agreeing.
+_MIN_REPEAT_WORDS = 3
+
+
+def _is_repeat_opening(clause: str, previous: str) -> bool:
+    """Whether this turn is opening with the exact clause the last one did.
+
+    Prose cannot hold this. runtime_core.txt has said "Never say a turn you
+    have already said" since before the tool removal, and on the real call in
+    call_events.db (97dd5ac7) the agent said "98407 21534 என்ன சார்?" on five
+    consecutive turns anyway, whatever the caller said in between. Two further
+    attempts to teach it - a demonstrated bad-line exchange in the core prompt,
+    then a shorter version using bracketed placeholders - both left the repeat
+    in place AND pushed the median first clause from 2.7s to 6.8s, because the
+    extra section lengthened every OTHER turn too. Measurements in
+    LLM_TEST_RESULTS.txt.
+
+    So it is enforced here, for the same reason and in the same shape as
+    speakable()'s one-question rule a few lines up: what the model will not do
+    on instruction, the server does for it.
+
+    Checked on the FIRST clause, before it is spoken, so none of the repeat
+    reaches the caller and the rest of the generation can be abandoned - which
+    makes this a latency win on exactly the turns that were slowest.
+    """
+    if not previous or clause != previous:
+        return False
+    return len(clause.split()) >= _MIN_REPEAT_WORDS
+
+
+def _append_caller_turn(session: CallSession, text: str) -> None:
+    """Add the caller's line, merging it into the previous one if the agent
+    never got a word out in between.
+
+    A barge-in that lands before the FIRST clause is spoken leaves
+    record_interrupted_turn() with an empty string and therefore nothing to
+    append, so the next caller turn lands directly behind the previous one.
+    Measured on the real call in call_events.db (97dd5ac7), a noisy stretch put
+    TWELVE consecutive user messages into a 21-message history, and against
+    that history the model stopped answering at all: it reproduced its own
+    previous turn verbatim on five turns running - "98407 21534 என்ன சார்?" -
+    whatever the caller said next. Replaying the identical message list against
+    the real model reproduces that reply character for character, and merging
+    the runs is what stops it.
+
+    Merging, not dropping. The caller really did say both things before anyone
+    answered, and the first half is where the CONTENT usually is - the real
+    call lost "ஆஸ்டோ department க்கு வேணும்" behind a barge-in and only the
+    noise that followed it would have survived a drop.
+    """
+    previous = session.messages[-1] if session.messages else None
+    if previous is not None and previous.get("role") == "user":
+        previous["content"] = f"{previous['content']} {text}"
+        return
+    session.messages.append({"role": "user", "content": text})
 
 
 def _trim_history(session: CallSession) -> None:

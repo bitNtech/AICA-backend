@@ -18,7 +18,12 @@ from fastapi.responses import HTMLResponse
 from .asr import IndicConformerAsr
 from .barge_in import ActiveSpeech, is_probably_self_echo
 from .clause_chunker import ClauseChunker
-from .conversation import AgentClause, AgentTurn, ConversationManager
+from .conversation import (
+    AgentClause,
+    AgentTurn,
+    ConversationManager,
+    split_reply_into_clauses as _split_reply_into_clauses,
+)
 from .llm import LlmClient
 from .persistence import CallEventStore
 from .settings import (
@@ -203,23 +208,6 @@ def _validate_start_event(payload: dict[str, object], settings: AudioSettings) -
     if language not in SUPPORTED_LANGUAGES:
         raise ValueError(f"unsupported language: {language}")
     return language
-
-
-def _split_reply_into_clauses(text: str) -> list[str]:
-    """One-shot helper: feed a whole LLM reply through ClauseChunker at once.
-
-    v1 does full-reply-then-chunk (BACKEND_COMPLETION.md Sec6 item 2), not
-    token-level streaming, so feed()+flush() together - rather than feed()
-    alone - is the right call here: the chunker never closes a clause on
-    buffer-end (see clause_chunker.py), so flush() is what releases the final
-    clause of any complete text, one-shot or not.
-    """
-    chunker = ClauseChunker()
-    clauses = chunker.feed(text)
-    remainder = chunker.flush()
-    if remainder:
-        clauses.append(remainder)
-    return clauses
 
 
 @app.websocket("/ws/audio")
