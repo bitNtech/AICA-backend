@@ -1,6 +1,12 @@
 # AICA-aruvi — handoff
 
-Branch `backend`. `pytest -q` is green at **194 passed** in ~6s. Start with `./run.sh`.
+`pytest -q` is green at **255 passed** in ~15s. Start with `./run.sh`.
+
+**Current measured state** (LLM_TEST_RESULTS.txt Part 11, all at
+`LLM_TEMPERATURE=0` except the socket numbers, which run the 0.3 product
+default): `safety_eval` **0 violations / 9 turns**, `register_eval` 13/14 turns
+and 2/7 calls, first audio **0.80 s** warm and **1.86 s** on the first call of
+a fresh server, greeting 0.34 s.
 
 The LLM half of the system has its own document: **[LLM_STACK.md](LLM_STACK.md)** —
 model, prompt architecture, every measured number, and the approaches that were
@@ -76,28 +82,44 @@ RTX 2050, **4096 MiB VRAM**. This is the binding constraint on everything.
 
 | | |
 |---|---|
-| Ollama, `aruvi-base` | 3.6 GB resident, **33% CPU / 67% GPU** |
-| VRAM free with it loaded | **439 MiB** |
+| Ollama, `aruvi-base` | 3.1 GB resident, **100% GPU** |
+| VRAM free with it loaded | **~500 MiB** (at `num_ctx 6144`) |
 | `torch` | `2.13.0+cpu` — a CPU-only wheel, no CUDA kernels |
 | IndicConformer checkpoint | 499 MB |
 
-**The LLM cannot be moved fully onto the GPU, and the ASR cannot be moved onto
-it at all.** Both were measured, not assumed:
+**The LLM now runs fully on the GPU. This reverses the old rule, and the
+reversal is a measurement — read the whole of this before touching it.**
 
-- Shrinking `num_ctx` 8192 → 6144 moved the split only 33/67 → **31/69**. It is
-  the *weights* that do not fit, not the KV cache, so no context setting fixes
-  this.
-- **Never add `PARAMETER num_gpu 99`.** Twice as fast on a 13-token prompt and
-  **114 seconds** on the real one: on a 4 GB card the weights fit but weights
-  plus KV cache do not, and Windows WDDM does not fail that allocation — it
-  silently spills to system RAM over PCIe. Benchmark only against real
-  `PromptBuilder` output; a short prompt will lie to you.
-- The ASR runs on CPU because the installed torch has no CUDA support, and
-  there are 439 MiB free against a 499 MB model. A CUDA torch build alone would
-  not be enough.
+`PARAMETER num_gpu 99` was forbidden here for most of this project's life,
+because it measured **114 seconds** on a real turn. That measurement was
+correct. What it never recorded was its *precondition*: ~1.2 GB of the card was
+being held by desktop apps (WhatsApp, Phone Link, CrossDeviceResume, Widgets
+and their WebView2 GPU processes), leaving 439 MiB free. Under that pressure
+the weights fit and the weights **plus** KV cache did not, and Windows WDDM
+does not fail that allocation — it silently spills to system RAM over PCIe.
 
-Real fixes, in order of effect: a card with more VRAM, or a smaller
-quantisation (costs quality — measure `register_eval` before and after).
+Close those apps and there are 3764 MiB free. Re-measured against real
+`PromptBuilder` output (3703 tokens), temperature 0, identical reply text:
+
+| config | split | generation |
+|---|---|---|
+| `num_ctx 8192`, no `num_gpu` | 33% CPU / 67% GPU | 12.9 tok/s |
+| `num_ctx 5120`, no `num_gpu` | 29% CPU / 71% GPU | 14.7 tok/s |
+| **`num_ctx 6144` + `num_gpu 99`** | **100% GPU** | **31.3 tok/s** |
+
+**2.2x — the largest latency win measured on this project.** See
+LLM_TEST_RESULTS.txt Part 10.
+
+- **The VRAM precondition is not optional and not self-enforcing.** At
+  `num_ctx 6144` this leaves ~500 MiB free. `num_ctx 8192` leaves 339 MiB,
+  which is too little for the browser a tester is about to open. If something
+  takes the card, the 114s spill comes back and it is *silent* — check
+  `nvidia-smi` before blaming the model. To revert, delete the `PARAMETER` from
+  the Modelfile and rebuild; nothing else depends on it.
+- Benchmark only against real `PromptBuilder` output; a short prompt will lie
+  to you. That part of the old warning was always right.
+- The ASR still runs on CPU: the installed torch has no CUDA support, and there
+  is not room for a 499 MB model beside the LLM anyway.
 
 ### Ollama environment — persisted user env vars, for the SERVER process
 
@@ -171,10 +193,17 @@ model into VRAM. That is a cold-start cost, gone by the second call, and
   make a quiet syllable mean the same thing as silence, which is the reverted
   behaviour that cut turns off mid-word. `settings.py` refuses to start if the
   two are set equal.
-- **Loudness gates turn ONSET, and only onset.** `vad_onset_min_rms` and
-  `vad_onset_snr` are read in exactly one place — the not-yet-in-speech branch
-  of `process()` — so a television or a conversation across the room cannot
-  start a turn. Once a turn is open, endpointing is the VAD flag alone.
+- **Loudness gates turn ONSET, and gates the endpoint COUNTDOWN — but it can
+  never count as silence frame-for-frame.** `vad_onset_min_rms` and
+  `vad_onset_snr` are read in TWO places, and this bullet used to claim one,
+  which is wrong in a way that matters: the not-yet-in-speech branch of
+  `process()` (so a television across the room cannot start a turn) *and* the
+  in-speech branch, where only a LOUD flagged frame restarts the countdown —
+  that is the watchdog above. Once a turn is open, a frame that is merely
+  flagged is kept in the utterance and restarts nothing.
+  Guarded from both sides:
+  `test_a_quiet_syllable_can_never_end_a_turn_that_is_already_open` and
+  `test_a_turn_ends_when_the_caller_stops_even_though_the_room_stays_loud`.
   **That split is the whole design, and it is a scar.** An energy gate applied
   to EVERY frame was tried and reverted: a quiet trailing syllable scored as
   "silence", the endpoint countdown ran on through the middle of a word, and
@@ -378,6 +407,38 @@ Rebuild after editing the prompt:
 ---
 
 ## 7. OPEN
+
+0. ~~**The three clinical refusals collapse under pressure**~~ — **closed, by
+   exemplar.** `safety_eval` 3 violations → **0**. Each of the three exemplars
+   now demonstrates a THIRD push met with the *same* refusal words, refusal
+   first. Sec6's rule again: prose had asked for exactly this ordering for
+   several sessions and the model followed the demonstration instead.
+   LLM_TEST_RESULTS.txt Part 11.2.
+
+   Two traps came with it, both guarded now. **Never write an exemplar's caller
+   line from an eval turn** — it destroys what the eval measures *and* makes
+   the model read the line aloud as its own turn
+   (`test_no_exemplar_caller_line_restates_an_eval_scenarios_turn`). And
+   **exemplar length is not free**: the same three edits pushed the worst-case
+   prompt 155 tokens past `num_ctx`
+   (`test_a_call_of_long_turns_never_overflows_num_ctx`), and a longer block
+   moved an unrelated turn's register into Tamil script — a defect no single
+   line in it owns (Part 11.4).
+
+0b. **`safety_eval` shares turns with two of its own exemplars** — five
+   overlaps predate the guard above and are pinned, not fixed. On two of its
+   three cases it has been scoring recall alongside generalisation. Fixing it
+   means a held-out scenario set, and it invalidates comparison with every
+   safety number on record, so do it deliberately. **First job for the next
+   session** (Part 11.3).
+
+0c. **The context budget must be re-derived whenever `num_ctx` moves**, not
+   only when a prompt grows. Measured this session: the shipped config was
+   **1058 tokens over** `num_ctx 6144`, because Sec10.2 sized
+   `MAX_HISTORY_MESSAGES` against 8192 and the window was later lowered for
+   VRAM headroom. `conversation.py` now trims history by characters against a
+   budget derived from `LLM_NUM_CTX` (which must match the Modelfile; a test
+   checks). Part 11.5.
 
 1. ~~**Two questions in one turn**~~ — **guarded.** Prose failed three times;
    the fix is deterministic and lives in `stream_utterance`. It is not a

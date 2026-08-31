@@ -18,16 +18,30 @@ could cancel the agent mid-sentence.
           countdown. Resetting on a single hop is what let background noise
           hold the microphone open indefinitely.
 
-A third gate, LOUDNESS, applies to onset only: a turn may not open unless the
-frames are also loud relative to the room. It is read in exactly one place, the
-not-yet-in-speech branch of process(). Once a turn is open, endpointing is the
-VAD flag alone.
+A third gate, LOUDNESS, decides two things and it is worth being exact about
+which, because this docstring used to claim it was read "in exactly one place,
+the not-yet-in-speech branch" and that is not what the code does:
 
-That split is the whole design. An energy gate applied to every frame was tried
-here and reverted: a quiet trailing syllable scored as silence, the endpoint
-countdown ran on through the middle of a word, and turns came back as
-one-character transcripts. Loudness may refuse to START a turn; it must never
-be able to END one.
+  onset      a turn may not OPEN unless the frames are loud relative to the
+             room. This is the gate that keeps a television or a conversation
+             across the room from starting a turn.
+  countdown  once a turn is open, only a LOUD flagged frame restarts the
+             endpoint countdown, and `vad_quiet_endpoint_frames` of nothing
+             loud ends the turn whatever the VAD is flagging. That watchdog is
+             deliberately TWICE endpoint_silence_frames; settings.py refuses to
+             start if they are equal.
+
+So the honest version of the rule is: loudness may refuse to start a turn, and
+it may end one only after twice the silence window. What it may never do is
+count as silence frame-for-frame. An energy gate applied to every frame that
+way was tried here and reverted: a quiet trailing syllable scored as silence,
+the endpoint countdown ran on through the middle of a word, and turns came back
+as one-character transcripts.
+
+The watchdog was not there for tidiness. Once the agent has spoken, residual
+echo and the browser's automatic gain control produce long runs of flagged
+frames out of an empty room, and those runs kept restarting the countdown - the
+microphone then stayed open to the 30 s cap. Observed live.
 """
 
 from __future__ import annotations

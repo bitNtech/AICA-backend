@@ -215,7 +215,26 @@ class LlmSettings:
 
     # Turns are capped at ~40 words by the master prompt's turn discipline
     # (section 3), so completions don't need much headroom.
-    max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "300"))
+    #
+    # 300 -> 160. The longest LEGITIMATE turn measured on a real call is the
+    # closing handoff at ~115 tokens, so 160 keeps 40% headroom over anything
+    # the turn discipline permits. What 300 bought was runaway: a degenerate
+    # generation ("... அடிப்படை அடிப்படை அடிப்படை ..." x26) ran the full 300
+    # tokens and spoke 25 SECONDS of gibberish at a caller before the cap
+    # stopped it. The cap is the only thing that ever stops that, so it should
+    # sit just above real turns rather than far above them.
+    max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "160"))
+
+    # THE CONTEXT WINDOW, and it MUST match `PARAMETER num_ctx` in the
+    # Modelfile. Ollama's window is set there and nothing at runtime can read
+    # it back, so this is a restatement - which is exactly how the two drift.
+    # conversation.py sizes its history trim against this number, so a value
+    # LARGER than the Modelfile's silently re-creates the overflow that trim
+    # exists to prevent: Ollama truncates from the FRONT, taking the system
+    # prompt's language and clinical-safety rules with it, and says nothing.
+    # test_the_worst_case_turn_still_fits_inside_num_ctx reads the Modelfile
+    # and fails if they disagree.
+    num_ctx: int = int(os.getenv("LLM_NUM_CTX", "6144"))
 
     def __post_init__(self) -> None:
         if not self.model:
@@ -224,6 +243,8 @@ class LlmSettings:
             raise ValueError("LLM_TEMPERATURE must be between 0 and 2")
         if self.max_tokens <= 0:
             raise ValueError("LLM_MAX_TOKENS must be positive")
+        if self.num_ctx <= self.max_tokens:
+            raise ValueError("LLM_NUM_CTX must leave room for LLM_MAX_TOKENS")
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -252,9 +273,11 @@ class ConversationSettings:
         os.getenv("CONVERSATION_EXEMPLARS_PATH", str(_REPO_ROOT / "golden" / "flow_exemplars.json"))
     )
 
-    # Hard cap on LLM<->tool round-trips per caller turn, so a confused model
-    # can't chain tool calls forever instead of answering.
-    max_tool_iterations: int = int(os.getenv("LLM_MAX_TOOL_ITERATIONS", "6"))
+    # LLM_MAX_TOOL_ITERATIONS was here, capping LLM<->tool round-trips per
+    # turn. It went with the tool layer (LLM_STACK.md Sec5) and was dead:
+    # validated on every startup, read by nothing. Restoring tools per-flow
+    # means restoring it - along with the 1778 prompt tokens and the eval
+    # regression that measurement recorded.
 
     # v1 has no caller-metadata source (no CRM lookup, no SIP headers) wired
     # in yet, so this is the only {{agent_name}} substitution main.py can
@@ -263,8 +286,6 @@ class ConversationSettings:
     agent_name: str = os.getenv("CONVERSATION_AGENT_NAME", "Gayathri")
 
     def __post_init__(self) -> None:
-        if self.max_tool_iterations <= 0:
-            raise ValueError("LLM_MAX_TOOL_ITERATIONS must be positive")
         if not self.agent_name:
             raise ValueError("CONVERSATION_AGENT_NAME must not be empty")
 
@@ -335,7 +356,11 @@ class TtsSettings:
     #
     # This also shortens every turn, so it is a latency win as well as a
     # naturalness one: the caller stops waiting for the agent to finish sooner.
-    rate: str = os.getenv("TTS_RATE", "+0%")
+    # +10%, not +0%. This code default said +0% while HANDOFF.md Sec5 and
+    # .env.example both documented +10%, so the shipped rate was whichever of
+    # the three the reader happened to believe. +10% is the one that was
+    # actually asked for and measured, and it shortens every turn by ~9%.
+    rate: str = os.getenv("TTS_RATE", "+10%")
 
     # Edge PADS every clip it returns, and the padding is what the caller hears
     # as a long gap after every full stop. Measured on real agent clauses at

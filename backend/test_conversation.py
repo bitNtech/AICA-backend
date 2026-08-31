@@ -14,6 +14,7 @@ import logging
 
 from .conversation import (
     KNOWN_PLACEHOLDERS,
+    _CANNOT_RECALL,
     _with_language_reminder,
     AgentClause,
     AgentTurn,
@@ -21,7 +22,7 @@ from .conversation import (
     render_template,
 )
 from .llm import LlmReply, ReplyComplete, TextDelta, ToolCall
-from .settings import ConversationSettings
+from .settings import ConversationSettings, LlmSettings
 
 TEMPLATE = "Hello {{agent_name}}, caller {{caller_mobile}} mrn {{mrn}} unknown {{bogus_var}}."
 
@@ -35,6 +36,11 @@ class _ScriptedLlm:
     chunker's job of reassembling a clause split across deltas, which is the
     part most likely to break.
     """
+
+    # The real client carries the settings conversation.py sizes the history
+    # trim against (num_ctx / max_tokens), so the fake has to as well - a
+    # fake missing them would exercise a trim that never bounds anything.
+    settings = LlmSettings()
 
     def __init__(self, replies: list[LlmReply]) -> None:
         self._replies = list(replies)
@@ -73,8 +79,8 @@ def _captured_log_records(logger_name: str):
         logger.removeHandler(handler)
 
 
-def _make_manager(max_tool_iterations: int = 6) -> ConversationManager:
-    manager = ConversationManager(ConversationSettings(max_tool_iterations=max_tool_iterations))
+def _make_manager() -> ConversationManager:
+    manager = ConversationManager(ConversationSettings())
     # Stub the builder rather than reading the real prompt files: these tests
     # assert conversation plumbing, not prompt content.
     manager.prompts._core = TEMPLATE
@@ -148,15 +154,31 @@ async def test_stream_utterance_yields_clauses_then_the_completed_turn() -> None
     assert events[-1].text == "கண்டிப்பா சார். Patient பேரு சொல்லுங்க?"
 
 
-async def test_turn_reports_an_identifier_no_tool_returned() -> None:
-    """The parroted-exemplar failure, end to end through the manager."""
+async def test_an_invented_identifier_is_never_spoken_to_the_caller() -> None:
+    """The parroted-exemplar failure, end to end through the manager.
+
+    Observed live over the socket: asked for a mobile number and given an age
+    instead, the agent said "90045 33218 என்ன சொல்லுங்க?" - the phone number
+    out of its own few-shot exemplar. grounding.py detected it, and the caller
+    had already heard it, because detection ran after the clause was streamed.
+    speakable() is a pre-speech choke point, so it never leaves the server now.
+    """
     manager = _make_manager()
     manager.start_call("conn-1", agent_name="Gayathri")
     llm = _ScriptedLlm([LlmReply(content="ஆமாம், MRN ARV-604417-னு இருக்கு. சரியா?")])
 
-    events = [event async for event in manager.stream_utterance("conn-1", llm, "என் details check பண்ணுங்க")]
+    events = [e async for e in manager.stream_utterance("conn-1", llm, "என் details check பண்ணுங்க")]
+    turn = events[-1]
 
-    assert events[-1].ungrounded == ("ARV-604417",)
+    assert "ARV-604417" not in turn.text, f"the caller was told an invented MRN: {turn.text}"
+    for event in events[:-1]:
+        assert "ARV-604417" not in event.text, f"invented MRN reached a clause: {event.text}"
+    # ...and the turn still says something coherent rather than trailing off
+    # mid-sentence, which is what grounding.py's docstring warned against.
+    assert turn.text.endswith(_CANNOT_RECALL)
+    # Nothing ungrounded survives into the reported turn, because nothing
+    # ungrounded was spoken.
+    assert turn.ungrounded == ()
 
 
 def test_record_interrupted_turn_keeps_history_honest_after_barge_in() -> None:
@@ -253,8 +275,8 @@ def test_a_fact_the_server_does_know_is_still_carried() -> None:
 
 
 def test_a_long_call_never_pushes_the_system_prompt_out_of_the_context_window() -> None:
-    """The assembled prompt is ~3.5k tokens against num_ctx 8192, so a call has
-    ~4.6k tokens of room for history and nothing used to bound it. Overflow
+    """The assembled prompt is ~3.8k tokens against num_ctx 6144, so a call has
+    ~2k tokens of room for history and nothing used to bound it. Overflow
     makes Ollama truncate from the FRONT, taking the language rules with it -
     the agent switches to English and invents identifiers, silently. That is
     the exact failure backend/prompt_builder.py exists to prevent.
@@ -297,6 +319,120 @@ def test_a_long_call_never_pushes_the_system_prompt_out_of_the_context_window() 
     assert last_messages[0]["role"] == "system"
     assert last_messages[0]["content"] == session.messages[0]["content"]
     assert len(last_messages) <= MAX_HISTORY_MESSAGES + 3  # + facts/reminder tail
+
+
+# The longest turns this server has actually produced, out of the 794 real turn
+# texts in call_events.db: 177 characters for an agent turn (median 60) and 67
+# for a caller turn (median 20). Quoted rather than read from the database so
+# this test stays offline, and used for EVERY turn of the long call below,
+# because "24 messages" is only a safe bound at median length.
+LONGEST_REAL_AGENT_TURN = (
+    "கண்டிப்பா மேடம். General ward-க்கு காலை 11 to 12, மாலை 5 to 7. "
+    "ICU-க்கு மாலை 5 to 5:30 மட்டும், அதுவும் ஒரு நேரத்துல ஒருத்தர் தான். "
+    "எந்த ward-ல பார்க்க வேண்டும் என்று சொல்லுங்க?"
+)
+LONGEST_REAL_CALLER_TURN = (
+    "பொறுமையாக பிடிச்சா நாலு மாசத்துக்கு ஒரு மாசத்துக்குள்ள பிரிச்சுடும்"
+)
+
+
+def _modelfile_num_ctx() -> int:
+    import re
+    from pathlib import Path
+
+    modelfile = (Path(__file__).resolve().parent.parent / "Modelfile").read_text(encoding="utf-8")
+    match = re.search(r"^PARAMETER\s+num_ctx\s+(\d+)", modelfile, re.MULTILINE)
+    assert match, "Modelfile has no num_ctx PARAMETER"
+    return int(match.group(1))
+
+
+def test_llm_num_ctx_matches_the_modelfile() -> None:
+    """Two statements of one number, so they are checked rather than trusted.
+
+    Ollama's window is set by the Modelfile and nothing at runtime can read it
+    back, so conversation.py has to be told. A setting LARGER than the
+    Modelfile's makes the history trim size itself against a window that does
+    not exist, and the overflow it exists to prevent comes back silently.
+    """
+    assert LlmSettings().num_ctx == _modelfile_num_ctx()
+
+
+def test_a_call_of_long_turns_never_overflows_num_ctx() -> None:
+    """The bound that message-counting cannot provide, driven end to end.
+
+    Measured with Ollama's own prompt_eval_count while auditing this: the
+    widest playbook plus 24 messages built from the LONGEST turns above came to
+    7202 tokens against num_ctx 6144 - 1058 OVER, in the shipped
+    configuration. Sec10.2 had sized MAX_HISTORY_MESSAGES against num_ctx 8192
+    and the window was later lowered to 6144 for VRAM headroom without the
+    budget being re-derived. Overflow makes Ollama truncate from the FRONT,
+    taking the language and clinical-safety rules with it, and it is silent.
+
+    Uses the REAL prompt files and the REAL emergency.escalate playbook - the
+    widest, and the one a call can switch to at any moment - because the
+    failure is a property of the assembled prompt, not of the plumbing.
+
+    Asserts on what the model was ACTUALLY HANDED (llm.calls[-1]) rather than
+    on the trimmer in isolation: an earlier version of the neighbouring test
+    exercised the helper alone and still passed with its call site deleted.
+    """
+    import asyncio
+
+    from .conversation import (
+        _HISTORY_TOKENS_PER_CHAR,
+        _LANGUAGE_REMINDER,
+        _PROMPT_TOKENS_PER_CHAR,
+        _TOKENS_PER_MESSAGE,
+    )
+    from .prompt_builder import PromptBuilder
+
+    settings = ConversationSettings()
+    manager = ConversationManager(settings)
+    manager.prompts = PromptBuilder(
+        settings.runtime_core_path, settings.prompt_path, settings.exemplars_path
+    )
+    manager.prompts.load()
+
+    turns = 40
+    llm = _ScriptedLlm([LlmReply(content=LONGEST_REAL_AGENT_TURN) for _ in range(turns)])
+    manager.start_call("conn-ctx", agent_name="Gayathri")
+    # The widest flow, pinned: detect_intent would route these turns to
+    # info.general, which is the narrowest and would prove nothing.
+    manager._sessions["conn-ctx"].intent = "emergency.escalate"
+
+    async def run() -> None:
+        for _ in range(turns):
+            async for _event in manager.stream_utterance("conn-ctx", llm, LONGEST_REAL_CALLER_TURN):
+                pass
+
+    asyncio.run(run())
+
+    num_ctx = _modelfile_num_ctx()
+    max_tokens = LlmSettings().max_tokens
+    for index, messages in enumerate(llm.calls):
+        system_chars = sum(
+            len(m["content"]) for m in messages if m.get("role") == "system"
+        )
+        history_chars = sum(
+            len(m["content"] or "") for m in messages if m.get("role") != "system"
+        )
+        estimated = round(
+            system_chars * _PROMPT_TOKENS_PER_CHAR
+            + history_chars * _HISTORY_TOKENS_PER_CHAR
+            + _TOKENS_PER_MESSAGE * len(messages)
+        )
+        assert estimated + max_tokens <= num_ctx, (
+            f"turn {index} handed the model ~{estimated} prompt tokens; with "
+            f"LLM_MAX_TOKENS {max_tokens} that is {estimated + max_tokens - num_ctx} "
+            f"over num_ctx {num_ctx}. Ollama truncates from the front and drops "
+            f"the language rules. ({system_chars} chars of prompt, "
+            f"{history_chars} of history over {len(messages)} messages.)"
+        )
+        assert _LANGUAGE_REMINDER in messages[-1]["content"]
+
+    # The trim has to have actually bitten, or this asserts nothing: 40 turns
+    # of these lengths are far past the budget.
+    assert len(llm.calls[-1]) < turns, "history was never trimmed - the test proves nothing"
 
 
 def test_the_english_caller_detector_counts_words_not_letters() -> None:
@@ -393,3 +529,99 @@ async def test_one_question_per_turn_is_left_alone() -> None:
     events = [event async for event in manager.stream_utterance("conn-q3", llm, "book பண்ணணும்")]
 
     assert events[-1].text == "கண்டிப்பா சார். Patient பேரு சொல்லுங்க?"
+
+
+async def test_caller_turns_merge_when_the_agent_never_got_a_word_out() -> None:
+    """A barge-in before the first clause leaves the history with no reply in it.
+
+    record_interrupted_turn() has nothing to append when zero clauses were
+    spoken, so without merging the next caller turn lands directly behind the
+    previous one. On the real call in call_events.db (97dd5ac7) that put twelve
+    consecutive user messages into a 21-message history and the model stopped
+    answering, reproducing its own previous turn verbatim instead.
+    """
+    manager = _make_manager()
+    manager.start_call("conn-merge", agent_name="Gayathri")
+    llm = _ScriptedLlm([LlmReply(content="சரி சார்.") for _ in range(3)])
+
+    # Exactly what main.py does on a barge-in that lands before the first
+    # clause: abandon the generator without consuming a clause, then report
+    # that nothing was spoken. Driving the real path, not _append_caller_turn.
+    for cut_off in ("ஆஸ்டோ department க்கு வேணும்", "ஆற்று"):
+        turn = manager.stream_utterance("conn-merge", llm, cut_off)
+        await turn.asend(None)
+        await turn.aclose()
+        manager.record_interrupted_turn("conn-merge", "")
+
+    async for _event in manager.stream_utterance("conn-merge", llm, "என் பேரு நானே"):
+        pass
+
+    messages = manager._sessions["conn-merge"].messages
+    runs = [a for a, b in zip(messages, messages[1:]) if a["role"] == b["role"] == "user"]
+    assert not runs, f"history still has consecutive user messages: {messages}"
+    # Merged, not dropped: the department is the CONTENT of that stretch and
+    # dropping the older message would lose it behind the noise that followed.
+    caller_said = " ".join(m["content"] for m in messages if m["role"] == "user")
+    assert "ஆஸ்டோ department க்கு வேணும்" in caller_said
+    assert "ஆற்று" in caller_said
+
+
+async def test_the_agent_never_opens_two_turns_with_the_same_clause() -> None:
+    """runtime_core.txt has forbidden this in prose since before the tool removal
+    and the model does it anyway - five turns running on the real call. The
+    breaker is enforced in code for the same reason speakable() is."""
+    manager = _make_manager()
+    manager.start_call("conn-rep", agent_name="Gayathri")
+    stuck = "உங்க registered mobile number சொல்லுங்க?"
+    llm = _ScriptedLlm([LlmReply(content=stuck) for _ in range(4)])
+
+    said = []
+    for caller in ("98407", "வெண்ணூர் கிழவனை", "எல்லாம்", "தேடியா"):
+        events = [e async for e in manager.stream_utterance("conn-rep", llm, caller)]
+        said.append(events[-1].text)
+
+    assert said[0] == stuck, "the FIRST time is not a repeat and must be spoken"
+    assert stuck not in said[1:], f"the agent said its own last turn again: {said}"
+    # Escalating, so a caller on a line that is not working reaches the handoff
+    # instead of the same sentence until they hang up.
+    assert len(set(said[1:])) == 3, f"the recovery lines repeated each other: {said}"
+    assert "Desk-ல இருந்து" in said[-1], f"never offered the callback: {said}"
+
+
+async def test_the_repeat_breaker_leaves_a_short_acknowledgement_alone() -> None:
+    """Two turns may legitimately both open with "சரி சார்." - only a longer
+    opening repeated verbatim is the model stuck rather than agreeing."""
+    manager = _make_manager()
+    manager.start_call("conn-ack", agent_name="Gayathri")
+    llm = _ScriptedLlm(
+        [
+            LlmReply(content="சரி சார். உங்க பேரு சொல்லுங்க?"),
+            LlmReply(content="சரி சார். உங்க வயசு சொல்லுங்க?"),
+        ]
+    )
+
+    first = [e async for e in manager.stream_utterance("conn-ack", llm, "book பண்ணணும்")][-1]
+    second = [e async for e in manager.stream_utterance("conn-ack", llm, "நானே")][-1]
+
+    assert first.text == "சரி சார். உங்க பேரு சொல்லுங்க?"
+    assert second.text == "சரி சார். உங்க வயசு சொல்லுங்க?", "the breaker fired on an acknowledgement"
+
+
+async def test_the_repeat_breaker_never_suppresses_a_repeated_refusal() -> None:
+    """runtime_core.txt's CLINICAL SAFETY section requires a refused request to
+    be refused AGAIN in the same words when the caller pushes - to a frightened
+    caller a changed subject reads as being ignored. The repeat breaker forbids
+    repeating an opening clause, so without an exemption it would replace the
+    second refusal with "clear-ஆ கேட்கல", which is a safety regression.
+    """
+    manager = _make_manager()
+    manager.start_call("conn-refuse", agent_name="Gayathri")
+    refusal = "Phone-ல அதை நான் சொல்ல முடியாது சார்."
+    llm = _ScriptedLlm([LlmReply(content=refusal) for _ in range(3)])
+
+    said = []
+    for caller in ("Value-ஐ சொல்லுங்க", "ஒரு தடவை சொல்லுங்க", "please சொல்லுங்க மேடம்"):
+        events = [e async for e in manager.stream_utterance("conn-refuse", llm, caller)]
+        said.append(events[-1].text)
+
+    assert said == [refusal] * 3, f"the refusal was suppressed or altered: {said}"

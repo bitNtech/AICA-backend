@@ -76,6 +76,49 @@ class ConversationTurnOutcome:
     interrupted: bool = False
 
 
+def _warm_tts_cache(tts) -> None:
+    """Synthesize the fixed lines once so the first caller does not pay for them."""
+    try:
+        _warm(tts)
+    except Exception:
+        # Pure optimisation - a cold cache only costs latency, so nothing here
+        # may stop the server coming up.
+        logger.warning("TTS cache warm failed", exc_info=True)
+
+
+def _warm(tts) -> None:
+    from .conversation import (
+        _CANNOT_RECALL,
+        _GO_AHEAD,
+        _STUCK_REPLIES,
+        OPENING_LINE,
+        render_template,
+    )
+
+    lines = [
+        *_split_reply_into_clauses(render_template(OPENING_LINE, {"agent_name": "Gayathri"})),
+        _GO_AHEAD,
+        _CANNOT_RECALL,
+        *_STUCK_REPLIES,
+        # The openers the model reaches for on almost every call.
+        "சரி சார்.",
+        "கண்டிப்பா சார்.",
+        "நன்றி சார்.",
+        "புரியுது சார்.",
+    ]
+    warmed = 0
+    for line in lines:
+        try:
+            tts.synthesize(line, tts.settings.language)
+            warmed += 1
+        except Exception:
+            # Pure optimisation - a cold cache only costs latency, so a failure
+            # here must never stop the server coming up.
+            logger.warning("TTS cache warm failed for %r", line[:40], exc_info=True)
+            break
+    logger.info("TTS cache warmed with %d of %d fixed lines", warmed, len(lines))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = AudioSettings()
@@ -110,6 +153,20 @@ async def lifespan(app: FastAPI):
         # ready gate. TTS_ENGINE=svara still lands here until a real
         # svara-TTS reference exists (BACKEND_COMPLETION.md Sec3.2).
         logger.exception("TTS engine %r failed to load", tts_settings.engine)
+
+    if tts.ready:
+        # Edge is a NETWORK call, so the first time any clause is synthesized it
+        # costs a round trip to Microsoft and only then enters the MP3 cache.
+        # Measured over the socket: the greeting took 1.55s on a server's first
+        # call and 0.04s on every one after, and the first turns of that call
+        # each paid ~1s of TTS on top of the LLM. Saying these few fixed lines
+        # once at startup moves that cost off the first caller.
+        #
+        # Only lines the server itself can produce verbatim - the scripted
+        # opening and conversation.py's canned recovery lines - plus the handful
+        # of openers the model reaches for constantly. Anything else is
+        # generated text and cannot be predicted.
+        asyncio.create_task(asyncio.to_thread(_warm_tts_cache, tts))
 
     try:
         call_store.load()
@@ -608,6 +665,20 @@ async def capture_browser_audio(websocket: WebSocket) -> None:
                     payload = json.loads(text_message)
                     event_type = payload.get("type")
                     if event_type == "call_started":
+                        if started:
+                            # A second call_started used to reset the session
+                            # and overwrite prewarm_task, orphaning the first
+                            # one - teardown then cancelled only the last, and
+                            # the greeting was spoken twice into the same call.
+                            # One call per socket; the client reconnects for a
+                            # new one.
+                            await send_event(
+                                {
+                                    "type": "protocol_error",
+                                    "message": "call_started already received on this connection",
+                                }
+                            )
+                            continue
                         language = _validate_start_event(payload, settings)
                         started = True
                         await send_event({"type": "pipeline_configured", "language": language})

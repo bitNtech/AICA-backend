@@ -37,7 +37,13 @@ from .conversation import ConversationManager
 from .llm import LlmReply, ReplyComplete, TextDelta
 from .main import app
 from .persistence import CallEventStore
-from .settings import AudioSettings, ConversationSettings, PersistenceSettings, SecuritySettings
+from .settings import (
+    AudioSettings,
+    ConversationSettings,
+    LlmSettings,
+    PersistenceSettings,
+    SecuritySettings,
+)
 
 PROMPT_TEMPLATE = "Hello {{agent_name}}."
 
@@ -76,6 +82,9 @@ class _ScriptedLlm:
     """Same pattern as test_conversation.py's fake - scripted replies, no network."""
 
     ready = True
+    # See test_conversation.py's fake: conversation.py sizes its history
+    # trim against these.
+    settings = LlmSettings()
 
     def __init__(self, replies: list[LlmReply]) -> None:
         self._replies = list(replies)
@@ -274,6 +283,33 @@ def test_valid_call_started_configures_pipeline_and_speaks_greeting() -> None:
     # substitution (agent_name) made it into what got spoken.
     assert "Gayathri" in "".join(clause_texts)
     assert tts.calls, "TTS should have been invoked for the greeting"
+
+
+def test_a_second_call_started_is_refused_rather_than_restarting_the_call() -> None:
+    """One call per socket.
+
+    A second call_started used to run the whole opening again on the same
+    connection: a fresh CallSession (throwing away the history the call had
+    built), the greeting queued and spoken a second time, and a second prewarm
+    task assigned over the first - which orphaned it, since teardown cancels
+    only the task the variable still points at.
+    """
+    tts = _FakeTts(ready=True)
+    _set_app_state(tts=tts)
+    client = TestClient(app)
+    with client.websocket_connect("/ws/audio") as ws:
+        _next_json(ws)  # ready
+        ws.send_json(_VALID_CALL_STARTED)
+        _next_json(ws)  # pipeline_configured
+        first_turn = _drain_agent_turn(ws)
+
+        ws.send_json(_VALID_CALL_STARTED)
+        error = _next_json(ws)
+
+    assert error["type"] == "protocol_error"
+    assert "already" in error["message"]
+    # ...and no second greeting followed it.
+    assert [e["type"] for e in first_turn].count("agent_speaking_end") == 1
 
 
 def test_user_text_before_call_started_is_a_protocol_error() -> None:

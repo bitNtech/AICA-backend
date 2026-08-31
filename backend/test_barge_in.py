@@ -246,6 +246,44 @@ def test_the_normal_gate_applies_once_the_room_is_quiet() -> None:
     asyncio.run(scenario())
 
 
+def test_a_caller_talking_through_the_moment_the_room_goes_quiet_can_still_cut_in() -> None:
+    """The bar FALLS from 40 frames to 15 when the agent's audio drains, and a
+    caller who keeps talking across that moment is already past 15.
+
+    Not a contrived ordering. A turn's clauses are synthesized over a network
+    call measured at 0.9-10.8s, so the audio sent so far routinely finishes
+    playing while the agent is still mid-turn. Under the == test this counter
+    had already overshot the lowered bar and could never equal it again, so
+    barge-in was dead for the rest of that utterance - on precisely the turns
+    where the caller has the most reason to interrupt.
+    """
+
+    async def scenario() -> None:
+        now = [1000.0]
+        speech = ActiveSpeech(15, 40, clock=lambda: now[0])
+        task = asyncio.create_task(asyncio.sleep(10))
+        speech.set(task)
+        speech.note_audio_sent(0.2)
+        assert speech.audible
+
+        # 20 unbroken frames while the agent is still audible: over the quiet
+        # bar of 15, under the audible bar of 40, so nothing is cancelled yet.
+        for _ in range(20):
+            assert speech.note_speech(True) is False
+        assert not task.cancelled()
+
+        # The clause finishes playing and the next one has not arrived - the
+        # engine is a network call, so this gap is routine.
+        now[0] += 1.0
+        assert not speech.audible
+
+        assert speech.note_speech(True) is True, "the caller could no longer interrupt"
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
 def test_self_echo_is_recognised_but_a_real_caller_turn_is_not() -> None:
     agent = "நன்றி சார். எந்த department-க்கு வேணும்?"
 

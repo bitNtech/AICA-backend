@@ -166,7 +166,17 @@ class ActiveSpeech:
         required = (
             self._sustained_frames_while_audible if self.audible else self._sustained_frames
         )
-        if self._speech_frames != required:
+        # >=, not ==. The bar FALLS mid-utterance: it is 40 frames while the
+        # agent's own audio is still in the room and 15 once that audio has
+        # drained, and a turn's clauses are synthesized over a network call
+        # measured at 0.9-10.8s, so the room routinely goes quiet while the
+        # agent is still mid-turn. With == the counter has already passed 15 by
+        # then and can never equal it again, so a caller talking straight
+        # through that moment could not interrupt for the rest of the
+        # utterance - the one shape of barge-in this gate exists for.
+        # interrupt() is idempotent (it returns False once the task is done),
+        # so testing >= costs one extra call per frame and nothing else.
+        if self._speech_frames < required:
             return False
         return self.interrupt()
 

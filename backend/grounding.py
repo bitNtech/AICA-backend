@@ -18,11 +18,24 @@ come from - a tool result, the ledger, or the caller's own words. Everything
 else (prose, reassurance, clinical wording) is out of scope here and stays a
 matter for the prompt and the evals.
 
-Deliberately NOT a filter on speech: by the time a clause is checked it has
-already been streamed to the caller (see conversation.stream_utterance), and
-withholding half a sentence would produce worse output than the fault it is
-trying to hide. It reports, so the console shows it, the call log keeps it, and
-the evals can score it.
+This USED to say it was deliberately not a filter on speech, "because by the
+time a clause is checked it has already been streamed to the caller". That
+premise stopped being true: conversation.speakable() is now a pre-speech choke
+point that every clause passes through before it is spoken, and it calls
+ungrounded_identifiers() there. Observed live over the socket, the agent asked
+for a mobile number, was given an age, and read out the phone number from its
+own few-shot exemplar - this had detected it and logged an ERROR, and the
+caller had already heard it.
+
+The other half of that reasoning was real and still holds: withholding half a
+sentence is worse than the fault, because dropping the middle clause of
+"ஆமாம், MRN ARV-604417-னு இருக்கு. சரியா?" leaves "ஆமாம், சரியா?", which says
+nothing. So a fabrication ENDS the turn on a plain request for the detail
+rather than punching a hole in it. See conversation.speakable().
+
+unbacked_action_claims() below is still report-only, and for the original
+reason: the sentence it catches has no identifier to withhold, so there is
+nothing for a choke point to drop.
 """
 
 from __future__ import annotations
@@ -130,9 +143,11 @@ def grounding_sources(messages: list[dict]) -> list[str]:
 # said). The patterns deliberately match only COMPLETED forms - "அனுப்பிட்டேன்"
 # (I have sent), never "அனுப்பணுமா?" (shall I send?) - because offering to do
 # something is not claiming to have done it.
-# Exported so a caller that wants to act on one specific claim - see
-# conversation.py's _dispatch_ambulance_fallback() - can match it without
-# duplicating this literal.
+# Exported so a caller that wants to act on one specific claim can match it
+# without duplicating this literal. (It used to name
+# conversation.py's _dispatch_ambulance_fallback(), which went with the tool
+# layer - there is nothing to fall back TO now, which is the whole reason this
+# claim is worth reporting.)
 AMBULANCE_CLAIM = "said an ambulance has been dispatched"
 
 _ACTION_CLAIMS: tuple[tuple[str, frozenset[str], re.Pattern[str]], ...] = (

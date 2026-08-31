@@ -33,7 +33,7 @@ from .clause_chunker import ClauseChunker
 from .grounding import grounding_sources, unbacked_action_claims, ungrounded_identifiers
 from .llm import LlmClient, LlmReply, ReplyComplete
 from .prompt_builder import PromptBuilder, detect_intent
-from .settings import ConversationSettings
+from .settings import ConversationSettings, LlmSettings
 
 logger = logging.getLogger("aica.conversation")
 
@@ -145,6 +145,9 @@ class CallSession:
     # that a genuinely new turn clears it.
     recent_openings: list[str] = field(default_factory=list)
     repeat_count: int = 0
+    # The clauses of the scripted opening line, which the caller has already
+    # heard by the time any of this runs. See _opens_with_the_greeting_again.
+    greeting_clauses: frozenset[str] = frozenset()
 
     def known_facts(self) -> dict[str, str]:
         """Placeholder substitutions for this turn: opening metadata, overlaid
@@ -230,6 +233,7 @@ class ConversationManager:
                 {"role": "system", "content": ""},
                 {"role": "assistant", "content": greeting},
             ],
+            greeting_clauses=frozenset(split_reply_into_clauses(greeting)),
         )
         session.messages[0]["content"] = self._system_prompt_for(session)
         self._sessions[connection_id] = session
@@ -480,7 +484,51 @@ class ConversationManager:
             with, deliberately: one definition, so the guard and the eval
             cannot disagree about what a question is.
             """
-            nonlocal asked_question, stuck
+            nonlocal asked_question, stuck, regreeted, fabricated
+            # NEVER SPEAK AN IDENTIFIER THE AGENT CANNOT ACCOUNT FOR. Observed
+            # live over the socket: the agent asked for a mobile number, the
+            # caller answered "வயசு 58" instead, and the agent replied
+            # "90045 33218 என்ன சொல்லுங்க?" - reading out the phone number from
+            # its own few-shot exemplar as if the caller had said it. Needing a
+            # slot the conversation had not filled, it took the only value it
+            # had ever seen (LLM_STACK.md Sec6).
+            #
+            # grounding.py already detects exactly this and its docstring says
+            # it deliberately does NOT filter speech, "because by the time a
+            # clause is checked it has already been streamed to the caller".
+            # That premise stopped being true when speakable() became a
+            # pre-speech choke point: nothing here has been spoken yet. The
+            # other half of that reasoning - that withholding half a sentence
+            # is worse than the fault - is handled by _CANNOT_RECALL below,
+            # which asks for the detail plainly when the whole turn goes.
+            #
+            # A number the caller actually said is in `sources` and stays
+            # grounded, so ordinary read-back ("98407 21534, குறிச்சுக்கிட்டேன்")
+            # is untouched. The system prompt is deliberately not a source -
+            # that is what makes the exemplar's number fabricated here.
+            if ungrounded_identifiers(clause, sources):
+                logger.error(
+                    "grounding: %s withheld a fabricated identifier: %s",
+                    connection_id,
+                    clause,
+                )
+                fabricated = True
+                return False
+            # The caller has already heard the opening line - it is the first
+            # thing this call did. The model says it AGAIN when the caller
+            # opens with "ஹெல்லோ" instead of a request, because a greeting
+            # invites a greeting; measured on a clean call, turn 1 came back as
+            # the whole opening line verbatim, and on the recorded call it came
+            # back as the first three clauses with a real question stuck on the
+            # end. Dropping the clauses the caller has already heard leaves the
+            # real question, which is the only part of that turn worth saying.
+            #
+            # Only while nothing has been spoken yet, so the closing "வணக்கம்."
+            # - which follows "நன்றி சார்." - is never touched.
+            if not spoken and clause in session.greeting_clauses:
+                logger.info("greeting guard: %s re-greeted with %r", connection_id, clause)
+                regreeted = True
+                return False
             # The repeat check has to live in here rather than at the feed()
             # loop, because a one-clause reply - which is the exact shape a
             # stuck model produces - is never closed by feed() at all. The
@@ -510,9 +558,17 @@ class ConversationManager:
         # opened with. Declared before the stream so both the feed() loop and
         # the flush() tail can end the turn on it.
         stuck = False
-        stream = llm.stream(
-            _with_language_reminder(session.messages, self._turn_facts_message(session))
-        )
+        # Set by speakable() when it dropped a clause of the opening line.
+        regreeted = False
+        # Set by speakable() when it dropped a clause stating an identifier the
+        # agent could not account for.
+        fabricated = False
+        # Computed once per turn, not per clause: the caller's own words this
+        # call, plus any tool/ledger facts. Includes the user message appended
+        # a few lines above, so a number the caller just said is grounded.
+        sources = grounding_sources(session.messages)
+        facts = self._turn_facts_message(session)
+        stream = llm.stream(_with_language_reminder(session.messages, facts))
         async for event in stream:
             if isinstance(event, ReplyComplete):
                 reply = event.reply
@@ -522,19 +578,21 @@ class ConversationManager:
                     continue
                 spoken.append(clause)
                 yield AgentClause(clause)
-            if stuck:
-                # Nothing of the repeat was spoken and nothing more is worth
-                # generating, so drop the rest of the completion on the floor.
+            if stuck or fabricated:
+                # Nothing more is worth generating: a repeat is a stuck model,
+                # and the rest of a turn built around an invented identifier is
+                # built on the same mistake. Drop it on the floor.
                 await stream.aclose()
                 break
 
-        if reply is None and not stuck:
+        ended_early = stuck or fabricated
+        if reply is None and not ended_early:
             raise RuntimeError("LLM stream ended without a ReplyComplete event")
 
         # The chunker never closes a clause on buffer-end (see
         # clause_chunker.py), so the reply's last clause only exists once the
         # stream is done and we ask for it.
-        if not stuck:
+        if not ended_early:
             remainder = chunker.flush()
             if remainder and speakable(remainder):
                 spoken.append(remainder)
@@ -547,11 +605,28 @@ class ConversationManager:
             # from each other by design, so they could never match anyway, and
             # the escalating counter is what ends a hopeless stretch.
             session.messages.append({"role": "assistant", "content": recovery})
-            _trim_history(session)
+            _trim_history(session, llm.settings, facts)
             for clause in split_reply_into_clauses(recovery):
                 yield AgentClause(clause)
             yield AgentTurn(text=recovery)
             return
+
+        if fabricated:
+            # Always, not only when nothing was spoken. Dropping one clause out
+            # of the middle of a turn is what grounding.py's docstring warned
+            # would be "worse output than the fault it is trying to hide" -
+            # "ஆமாம், சரியா?" with the invented MRN cut out of the middle says
+            # nothing and sounds broken. Ending the turn on a plain request for
+            # the detail is coherent, and it is what the agent should have said.
+            spoken.append(_CANNOT_RECALL)
+            yield AgentClause(_CANNOT_RECALL)
+        elif not spoken and regreeted:
+            # The whole turn was the opening line over again, so there is
+            # nothing left to say - but silence on a phone call is worse than a
+            # wasted turn. This is what a receptionist says when the caller has
+            # said hello back and not yet got to why they rang.
+            spoken.append(_GO_AHEAD)
+            yield AgentClause(_GO_AHEAD)
 
         spoken_text = " ".join(spoken)
         # What was SPOKEN, not what was generated - the two differ whenever a
@@ -568,7 +643,7 @@ class ConversationManager:
             session.recent_openings.append(spoken[0])
             del session.recent_openings[:-RECENT_OPENINGS_KEPT]
         session.repeat_count = 0
-        _trim_history(session)
+        _trim_history(session, llm.settings, facts)
         yield AgentTurn(
             text=spoken_text,
             ungrounded=self._check_grounding(session, spoken_text),
@@ -584,13 +659,59 @@ class ConversationManager:
 # backend/prompt_builder.py exists to fix (the agent switches to English and
 # starts inventing identifiers), and it is silent.
 #
-# 40 messages is ~20 exchanges, far longer than any real hospital call and
-# still ~2.4k tokens inside the window. messages[0] is the system prompt and
-# is never dropped - it is the one message that must survive.
+# 40 -> 24, and the old number was NOT safe. "~2.4k tokens inside the window"
+# was an estimate, and measuring it broke it: the widest playbook
+# (emergency.escalate) makes the system prompt plus reminder 3932 tokens, and
+# 40 messages of realistically long turns are a further 4158, so the worst case
+# was 8390 tokens against num_ctx 8192 - already 198 tokens OVER, in the
+# shipped configuration, before this session changed anything. Overflow makes
+# Ollama truncate from the FRONT and take the language rules with it, silently.
 #
-# ponytail: a flat cap, not summarisation. If calls ever genuinely run past 20
-# exchanges, summarise the dropped span into the facts block instead.
-MAX_HISTORY_MESSAGES = 40
+# At num_ctx 6144 with LLM_MAX_TOKENS 160 the history budget is 2052 tokens;
+# 24 messages of ordinary turns fit inside it with room, and 24 is still 12
+# exchanges - longer than every real call captured in call_events.db.
+#
+# ponytail: a flat cap, not summarisation. It is now the CHEAP half of the
+# bound - _history_budget_chars() below is the half that actually holds.
+MAX_HISTORY_MESSAGES = 24
+
+
+# Counting messages cannot see the failure it was added to prevent, and this is
+# measured, not theoretical. Sec10.2 fixed an overflow at num_ctx 8192 by
+# lowering this cap to 24 and LLM_MAX_TOKENS to 300 -> 160. num_ctx was then
+# lowered 8192 -> 6144 for VRAM headroom and the budget was never re-derived
+# against the smaller window. Re-measured with Ollama's own prompt_eval_count,
+# on the widest playbook plus 24 messages built from the LONGEST turns this
+# server has actually produced (177 chars for an agent turn, 67 for a caller
+# turn, both out of call_events.db):
+#
+#     system prompt (emergency.escalate playbook + exemplars)   3765 tok
+#     + 24 messages of longest-real-turn history                3047 tok
+#     + facts block + language reminder                          230 tok
+#     + LLM_MAX_TOKENS 160                                       160 tok
+#                                                            ---------
+#                                                              7202 tok   vs num_ctx 6144
+#
+# 1058 tokens OVER, in the shipped configuration. Twenty-four messages is a
+# safe bound for turns of median length (60 chars) and an unsafe one for turns
+# of the length this agent actually produces at its longest, and no count-based
+# cap can tell those apart - which is why this now bounds the thing that
+# actually overflows.
+#
+# Tokens per character, measured the same way on this model:
+#
+#     assembled system prompt (markup + Tamil)   0.29 - 0.32
+#     dense Tamil/English turn text              0.83
+#
+# Rounded UP in both cases. The cost of over-trimming is that a pathological
+# call forgets an early turn; the cost of under-trimming is Ollama silently
+# truncating the system prompt, which is the bug prompt_builder.py exists to
+# prevent. Those are not symmetric.
+_PROMPT_TOKENS_PER_CHAR = 0.35
+_HISTORY_TOKENS_PER_CHAR = 0.85
+# The chat template's role markers around each message, plus the trailing
+# assistant header.
+_TOKENS_PER_MESSAGE = 4
 
 
 def split_reply_into_clauses(text: str) -> list[str]:
@@ -610,6 +731,15 @@ def split_reply_into_clauses(text: str) -> list[str]:
     return clauses
 
 
+# Said when the model's entire turn was the opening line again - the caller has
+# said hello back and not yet reached why they rang.
+_GO_AHEAD = "சொல்லுங்க சார், என்ன help வேணும்?"
+
+# Said when the whole turn was withheld for stating an invented identifier.
+# Mirrors runtime_core.txt's GROUNDING wording ("அது என்கிட்ட இப்போ இல்ல சார்")
+# rather than inventing a new register for it.
+_CANNOT_RECALL = "மன்னிச்சுடுங்க சார், அது என்கிட்ட இல்ல. ஒரு தடவை சொல்லுங்களா?"
+
 # What the agent says instead of repeating itself, in order. The first two ask
 # again in fresh words; the third stops asking and hands the call to the desk,
 # so a caller on a line that is not working gets an exit instead of the same
@@ -624,6 +754,13 @@ _STUCK_REPLIES = (
 # turns running may legitimately start with one. A longer opening repeated
 # verbatim is the model stuck, not the model agreeing.
 _MIN_REPEAT_WORDS = 3
+
+# "முடியாது" / "மாட்டேன்" - cannot, will not. The negative-ability forms the
+# prompt's own refusal line uses ("Phone-ல அதை நான் சொல்ல முடியாது") and the
+# ones the model paraphrases it into. Deliberately broad: this only ever
+# PERMITS a repeat, so a false match costs one repeated sentence, while a miss
+# costs a refusal the caller never hears.
+_REFUSAL_RE = re.compile(r"முடியாது|மாட்டேன்")
 
 
 RECENT_OPENINGS_KEPT = 3
@@ -650,6 +787,21 @@ def _is_repeat_opening(clause: str, recent: list[str]) -> bool:
     reaches the caller and the rest of the generation can be abandoned - which
     makes this a latency win on exactly the turns that were slowest.
     """
+    if _REFUSAL_RE.search(clause):
+        # A REFUSAL IS THE ONE TURN THAT IS SUPPOSED TO REPEAT, and suppressing
+        # it would be a clinical-safety regression, not a style one.
+        # runtime_core.txt's CLINICAL SAFETY section is explicit: "If the caller
+        # asks again for something you have already refused - a second time, a
+        # third time, begging - refuse again in the same words", because to a
+        # frightened caller a changed subject reads as being ignored and they
+        # hang up still not knowing they were told no.
+        #
+        # This did not fire in safety_eval - the model was failing to repeat
+        # the refusal at all, which is a separate pre-existing violation - so
+        # the conflict was latent rather than observed. It is exempted anyway:
+        # the breaker exists to stop a stuck model, and a refusal held under
+        # pressure is the opposite of stuck.
+        return False
     return len(clause.split()) >= _MIN_REPEAT_WORDS and clause in recent
 
 
@@ -680,13 +832,61 @@ def _append_caller_turn(session: CallSession, text: str) -> None:
     session.messages.append({"role": "user", "content": text})
 
 
-def _trim_history(session: CallSession) -> None:
-    """Drop the oldest exchanges, never the system prompt."""
+def _history_budget_chars(session: CallSession, settings: LlmSettings, facts: str) -> int:
+    """How many characters of history still fit in this turn's context window.
+
+    Everything else on the wire is fixed by the time this is asked: the system
+    prompt (whose width depends on which flow is active - emergency.escalate's
+    is ~430 tokens wider than the narrowest), the facts block, the language
+    reminder, and the room the reply itself needs. History gets what is left.
+    """
+    fixed_tokens = (
+        (len(session.messages[0]["content"]) + len(facts) + len(_LANGUAGE_REMINDER))
+        * _PROMPT_TOKENS_PER_CHAR
+        + settings.max_tokens
+        + _TOKENS_PER_MESSAGE * (MAX_HISTORY_MESSAGES + 3)
+    )
+    return max(0, int((settings.num_ctx - fixed_tokens) / _HISTORY_TOKENS_PER_CHAR))
+
+
+def _trim_history(session: CallSession, settings: LlmSettings, facts: str = "") -> None:
+    """Drop the oldest exchanges, never the system prompt.
+
+    Two bounds. The message count is the cheap one and catches the ordinary
+    long call; the character budget is the one that actually holds the
+    invariant, because it is the only one that can see a call whose turns are
+    long rather than merely numerous. See the measurement above
+    MAX_HISTORY_MESSAGES.
+
+    Trims from the FRONT, which is the same end Ollama would truncate - the
+    difference being that this end keeps the system prompt, and Ollama's does
+    not. On the 41 real calls in call_events.db the character budget never
+    binds (the longest ran 22 caller turns of median 20 chars); it exists for
+    the pathological call, which is the one that produced the original bug.
+    """
     overflow = len(session.messages) - 1 - MAX_HISTORY_MESSAGES
-    if overflow <= 0:
-        return
-    logger.info("call %s: trimming %d oldest messages", session.connection_id, overflow)
-    del session.messages[1 : 1 + overflow]
+    if overflow > 0:
+        logger.info("call %s: trimming %d oldest messages", session.connection_id, overflow)
+        del session.messages[1 : 1 + overflow]
+
+    budget_chars = _history_budget_chars(session, settings, facts)
+    # Never below one exchange: the turn just appended is what the next reply
+    # has to answer, so there is nothing useful left to give back after that.
+    dropped = 0
+    while len(session.messages) > 3 and _history_chars(session) > budget_chars:
+        del session.messages[1]
+        dropped += 1
+    if dropped:
+        logger.info(
+            "call %s: trimming %d more messages to stay inside num_ctx (%d chars of budget)",
+            session.connection_id,
+            dropped,
+            budget_chars,
+        )
+
+
+def _history_chars(session: CallSession) -> int:
+    return sum(len(message.get("content") or "") for message in session.messages[1:])
 
 
 # Recency beats distance: a small model reliably drifts into pure English by

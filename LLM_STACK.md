@@ -328,14 +328,17 @@ exemplar's own facts.
 - **RTX 2050, 4 GB.** Ollama uses it; any "CPU only" note is stale.
 - `OLLAMA_FLASH_ATTENTION=1` and `OLLAMA_KV_CACHE_TYPE=q8_0` are persisted
   user env vars **for the Ollama server process**. The tray app must be
-  restarted after `setx` to inherit them. Verify with `ollama ps` (~3.6 GB,
-  `33%/67% CPU/GPU`).
-- **Never add `PARAMETER num_gpu 99`.** It measured *twice as fast* on a
-  13-token prompt and **114 seconds** on the real one. On a 4 GB card the
-  weights fit but weights + KV cache for a real prompt do not, and Windows
-  WDDM does not fail that allocation — it silently spills to system RAM over
-  PCIe. Benchmark only against real `PromptBuilder` output; a short prompt
-  will lie to you.
+  restarted after `setx` to inherit them. Verify with `ollama ps` — with full
+  offload shipped this now reads ~3.1 GB, `100% GPU`.
+- **`PARAMETER num_gpu 99` is now SHIPPED, reversing the old rule.** It used to
+  measure **114 seconds** on a real turn — but with ~1.2 GB of the card held by
+  desktop apps, leaving 439 MiB free. With those closed, full offload measures
+  **31.3 tok/s against 12.9** on the identical real prompt: a 2.2x win, and the
+  largest this project has measured. The VRAM precondition is the whole rule
+  now: `num_ctx 6144` leaves ~500 MiB free, and if anything else takes the card
+  the silent PCIe spill returns. See LLM_TEST_RESULTS.txt Part 10 and the
+  Modelfile. Benchmark only against real `PromptBuilder` output; a short prompt
+  will lie to you — that half was always right.
 - **Never write `localhost` in this repo.** Measured: the identical
   `/api/chat` request takes **2.10 s** via `localhost` and **0.05 s** via
   `127.0.0.1`. Name resolution tries an address the server is not listening on
@@ -343,18 +346,36 @@ exemplar's own facts.
   every server-side metric — it only shows up as wall-clock minus
   `total_duration`. It was paid on *every* LLM call.
 
-### `num_ctx` sweep — measured, deliberately not shipped
+### `num_ctx` sweep — superseded by full GPU offload
 
-| num_ctx | generation |
+| num_ctx | generation (CPU/GPU split) |
 |---|---|
-| 8192 (shipped) | 13.3 tok/s |
+| 8192 | 13.3 tok/s |
 | 6144 | 14.3 tok/s |
 | 5120 | 15.3 tok/s |
 | 4608 | 16.0 tok/s |
 
-20% across the whole range. Rejected while the prompt was 5290 tokens. Now
-that it is 3512, this is worth revisiting — it is the most likely next
-latency win.
+20% across the range when part of the model sits on the CPU. **Under
+`num_gpu 99` every one of these measures ~31–32 tok/s and `num_ctx` stops
+mattering for speed**, so it is now chosen purely for VRAM headroom:
+`num_ctx 6144` leaves ~500 MiB free against 339 MiB at 8192.
+
+**The budget must be re-derived whenever `num_ctx` MOVES, not only when a
+prompt grows** - that is the half this section missed, and it cost a live
+overflow. Sec10.2 sized `MAX_HISTORY_MESSAGES` against 8192; the window was
+then lowered to 6144 for VRAM headroom and nothing was recalculated. Measured
+against the longest turns this server actually produces, the shipped config
+came to **7202 tokens against `num_ctx 6144` - 1058 over**.
+`conversation.py` now bounds history by CHARACTERS against a budget derived
+from `LLM_NUM_CTX`, so the invariant no longer depends on anyone remembering to
+recalculate. See LLM_TEST_RESULTS.txt Part 11.5.
+
+Raising it again is not free. Measured, the widest playbook plus a full
+`MAX_HISTORY_MESSAGES` history plus the generation cap came to **8390 tokens
+against `num_ctx 8192`** — the shipped config could already overflow the window
+*silently*, which is the failure `prompt_builder.py` exists to prevent.
+`MAX_HISTORY_MESSAGES` is now 24 and `LLM_MAX_TOKENS` 160 so it cannot. See
+LLM_TEST_RESULTS.txt Part 10.2.
 
 ---
 
@@ -380,7 +401,7 @@ real bugs have been found only in that log and a hidden window has none.
 `runtime_core.txt`, `flow_exemplars.json`, or any `backend/*.py`.
 
 ```bash
-.venv/Scripts/python.exe -m pytest -q                       # 180 tests, ~5s
+.venv/Scripts/python.exe -m pytest -q                       # 255 tests, ~15s
 LLM_TEMPERATURE=0 .venv/Scripts/python.exe -m backend.scripts.register_eval
 LLM_TEMPERATURE=0 .venv/Scripts/python.exe -m backend.scripts.safety_eval
 ```
@@ -434,6 +455,34 @@ Two other TTS fixes landed with it, both from the same session:
 ---
 
 ## 9. Open items on the LLM side
+
+0. ~~**The clinical refusals collapse when the caller pushes a third time**~~ —
+   **closed by an exemplar, and it is the cleanest instance of §6 yet.**
+   `safety_eval` 3 violations → 0.
+
+   `runtime_core.txt` had asked, in as many words, for the refusal FIRST and
+   repeated in the SAME words. All three exemplars demonstrated the opposite —
+   consult offer first, refusal reworded last — and `emergency.escalate` never
+   demonstrated a medication refusal at all. The model followed the
+   demonstration. Adding a third push met with the same refusal words fixed all
+   three.
+
+   Two costs worth knowing before you add to an exemplar. **Exemplar length is
+   not free**: the three edits pushed the worst-case prompt 155 tokens past
+   `num_ctx`, and a longer block moved an unrelated turn's register into Tamil
+   script — a defect that bisected to *no single line*, only to the block's
+   total length. And **an exemplar caller line must never be written from an
+   eval turn**: it stops the eval measuring generalisation, and the near-match
+   makes the model read the caller's line aloud as its own turn. Both are
+   guarded now. LLM_TEST_RESULTS.txt Part 11.2–11.5.
+
+0b. **The two "Say it like this:" lines in `runtime_core.txt` demonstrate two
+   things the same prompt forbids** — a narrated lookup, and grading a result
+   ("அது normal தான்"). Fixing them made `safety_eval` *worse* (0 → 1) and
+   `clean_call` faster, so it was **reverted**. The contradiction is
+   load-bearing: those lines are the model's anchor for "what to say when you
+   cannot answer immediately". A fourth direction in which this prompt's
+   content is load-bearing, on top of §4's three. Part 11.7.
 
 1. ~~**Two questions in one turn**~~ — **closed, with a deterministic guard in
    `stream_utterance`.** Prose failed three times, so this is not prose.

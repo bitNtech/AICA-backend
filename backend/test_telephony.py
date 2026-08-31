@@ -29,7 +29,13 @@ from . import telephony as telephony_module
 from .conversation import ConversationManager
 from .llm import LlmReply, ReplyComplete, TextDelta
 from .persistence import CallEventStore
-from .settings import AudioSettings, ConversationSettings, PersistenceSettings, SecuritySettings
+from .settings import (
+    AudioSettings,
+    ConversationSettings,
+    LlmSettings,
+    PersistenceSettings,
+    SecuritySettings,
+)
 from .telephony import router
 from .tts import SynthesisResult
 from .vad import TenVadSegmenter as RealTenVadSegmenter
@@ -40,6 +46,10 @@ HOP = 256  # AudioSettings.vad_hop_size, 16kHz samples per VAD frame.
 
 class _ScriptedLlm:
     """Same fake as test_conversation.py: scripted replies, no real model."""
+
+    # conversation.py sizes its history trim against these - see
+    # test_conversation.py's fake.
+    settings = LlmSettings()
 
     def __init__(self, replies: list[LlmReply]) -> None:
         self._replies = list(replies)

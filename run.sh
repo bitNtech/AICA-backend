@@ -4,14 +4,23 @@
 #
 #     ./run.sh
 #
-# It finds a supported Python, builds .venv if missing, installs requirements
-# only when they are actually missing, makes sure Ollama has the model, starts
-# the API, waits until every component reports ready, and prints the console
-# URL. Ctrl+C stops it cleanly.
+# On a machine that has Python 3.10/3.11 and Ollama installed, this is the only
+# command needed. It finds a supported Python, builds .venv if missing,
+# installs requirements only when they are actually missing, seeds .env,
+# STARTS Ollama if it is not already up (with the three environment settings
+# that are worth 2.2x, which only apply if they are set before Ollama starts),
+# pulls the base model and builds aruvi-base from the Modelfile, starts the
+# API, waits until every component reports ready, and prints the console URL.
+# Ctrl+C stops it cleanly.
+#
+# It does NOT install Python or Ollama - those are system installs and it says
+# where to get them instead.
 #
 #   BACKEND_PORT=9000 ./run.sh     serve on another port
+#   BACKEND_HOST=0.0.0.0 ./run.sh  bind elsewhere (read the warning it prints)
 #   REINSTALL=1 ./run.sh           force a dependency reinstall
 #   RELOAD=1 ./run.sh              uvicorn --reload (development)
+#   SKIP_OLLAMA=1 ./run.sh         don't touch Ollama (it is remote, or managed)
 #
 set -Eeuo pipefail
 
@@ -21,10 +30,26 @@ cd "$ROOT_DIR"
 
 VENV_DIR="$ROOT_DIR/.venv"
 LOG_DIR="$ROOT_DIR/logs"
-LOG_FILE="$LOG_DIR/server.log"
 BACKEND_PORT="${BACKEND_PORT:-8000}"
+# logs/server.log for the default port, because that path is what HANDOFF.md
+# and every debugging note refer to. A second instance on another port gets its
+# own file rather than overwriting the first one's - two servers clobbering one
+# log is how you end up reading the wrong process's output.
+if [[ "$BACKEND_PORT" == "8000" ]]; then
+  LOG_FILE="$LOG_DIR/server.log"
+else
+  LOG_FILE="$LOG_DIR/server-$BACKEND_PORT.log"
+fi
+# 127.0.0.1, never "localhost" - measured, the identical /api/chat request takes
+# 2.10s via localhost and 0.05s via 127.0.0.1 on this stack.
+BACKEND_HOST="${BACKEND_HOST:-127.0.0.1}"
 OLLAMA_URL="${OLLAMA_URL:-http://127.0.0.1:11434}"
 MODEL_NAME="${LLM_MODEL:-aruvi-base}"
+# Read out of the Modelfile rather than restated here: two copies of a model
+# name is how they drift.
+BASE_MODEL="$(sed -n 's/^FROM[[:space:]]\{1,\}//p' "$ROOT_DIR/Modelfile" | head -1)"
+
+mkdir -p "$LOG_DIR"
 
 say()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m !\033[0m %s\n' "$*" >&2; }
@@ -101,13 +126,70 @@ if ! "$PY" -c "import nemo.collections.asr" >/dev/null 2>&1; then
   fi
 fi
 
+# ------------------------------------------------------------------ .env ----
+# settings.py loads .env however the app is started, and the ASR model is
+# gated, so a fresh machine needs somewhere to put HF_TOKEN. Seeded from the
+# example rather than written from scratch: the example carries the comments
+# explaining what each knob costs.
+if [[ ! -f "$ROOT_DIR/.env" && -f "$ROOT_DIR/.env.example" ]]; then
+  cp "$ROOT_DIR/.env.example" "$ROOT_DIR/.env"
+  say "Created .env from .env.example"
+  warn "Set HF_TOKEN in .env for the microphone (the ASR model is gated)."
+  warn "  Without it the server still runs and /console's typed turns work."
+fi
+
 # ---------------------------------------------------------------- ollama ----
-# The agent is useless without the LLM, so this is checked before the server
-# starts rather than surfacing later as a failed turn.
-if curl -fsS -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
-  if curl -fsS -m 5 "$OLLAMA_URL/api/tags" | grep -q "\"$MODEL_NAME"; then
+# The agent is useless without the LLM, so all of this happens before the
+# server starts rather than surfacing later as a failed turn.
+ollama_up() { curl -fsS -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; }
+
+if [[ -n "${SKIP_OLLAMA:-}" ]]; then
+  # Nothing below runs, including `ollama create`: under SKIP_OLLAMA the server
+  # may well be on another machine, and the local CLI would build the model on
+  # THIS one, where nothing would ever read it.
+  if ollama_up; then
+    say "Using the Ollama at $OLLAMA_URL as it is (SKIP_OLLAMA)"
+  else
+    warn "SKIP_OLLAMA is set and nothing is answering at $OLLAMA_URL."
+  fi
+elif ! ollama_up && command -v ollama >/dev/null 2>&1; then
+  # THESE THREE MUST BE EXPORTED BEFORE OLLAMA STARTS. Ollama reads them from
+  # the environment of its own server process, which is why this script used to
+  # only be able to warn about them. Starting Ollama ourselves is what makes
+  # them applicable on a machine nobody has configured by hand:
+  #   FLASH_ATTENTION + KV_CACHE_TYPE  part of what buys full GPU offload
+  #   KEEP_ALIVE=-1                    the model used to unload after 5 min
+  #                                    idle and the next turn paid a measured
+  #                                    14.9s reload
+  export OLLAMA_FLASH_ATTENTION="${OLLAMA_FLASH_ATTENTION:-1}"
+  export OLLAMA_KV_CACHE_TYPE="${OLLAMA_KV_CACHE_TYPE:-q8_0}"
+  export OLLAMA_KEEP_ALIVE="${OLLAMA_KEEP_ALIVE:--1}"
+  say "Starting Ollama (flash attention, q8_0 KV cache, keep-alive forever)"
+  ollama serve > "$LOG_DIR/ollama.log" 2>&1 &
+  for _ in $(seq 1 30); do ollama_up && break; sleep 1; done
+  ollama_up || warn "Ollama did not come up - see logs/ollama.log."
+fi
+
+if [[ -z "${SKIP_OLLAMA:-}" ]] && ollama_up; then
+  # An Ollama that was already running has whatever environment it was started
+  # with, and there is no way to read that back over the API - so this stays a
+  # warning for that case.
+  for var in OLLAMA_FLASH_ATTENTION OLLAMA_KV_CACHE_TYPE OLLAMA_KEEP_ALIVE; do
+    if [[ -z "${!var:-}" ]]; then
+      warn "$var is not set for the already-running Ollama - see HANDOFF.md §3."
+    fi
+  done
+
+  TAGS="$(curl -fsS -m 5 "$OLLAMA_URL/api/tags" || true)"
+  if grep -q "\"$MODEL_NAME" <<<"$TAGS"; then
     say "Ollama has $MODEL_NAME"
   elif command -v ollama >/dev/null 2>&1; then
+    # Pulled explicitly rather than left to `ollama create`, so a fresh machine
+    # gets download progress on a multi-GB base model instead of a silent wait.
+    if [[ -n "$BASE_MODEL" ]] && ! grep -q "\"$BASE_MODEL\"" <<<"$TAGS"; then
+      say "Pulling the base model $BASE_MODEL (one time, a few GB)"
+      ollama pull "$BASE_MODEL"
+    fi
     say "Building $MODEL_NAME from Modelfile (one time)"
     ollama create "$MODEL_NAME" -f "$ROOT_DIR/Modelfile"
   else
@@ -115,31 +197,61 @@ if curl -fsS -m 5 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; then
     warn "  ollama create $MODEL_NAME -f Modelfile"
   fi
 
-  # These are why the model gets a 67% GPU share instead of 42% on a 4GB card,
-  # and why it stops unloading after five minutes idle (a reload cost a
-  # measured 14.9s on the next turn). Ollama reads them from the environment of
-  # its OWN server process, so setting them here only helps if Ollama is
-  # started afterwards - hence a warning rather than an export.
-  for var in OLLAMA_FLASH_ATTENTION OLLAMA_KV_CACHE_TYPE OLLAMA_KEEP_ALIVE; do
-    if [[ -z "${!var:-}" ]]; then
-      warn "$var is not set for the Ollama server - see HANDOFF.md §3."
+  # THE VRAM PRECONDITION, which is not self-enforcing. The Modelfile ships
+  # PARAMETER num_gpu 99 because full offload measured 2.2x (31.3 vs 12.9
+  # tok/s). That is only true while the card is free: with ~1.2 GB held by
+  # desktop apps the weights fit and the weights PLUS the KV cache did not, and
+  # Windows WDDM does not fail that allocation - it spills to system RAM over
+  # PCIe, silently, and one turn measured 114 SECONDS.
+  if command -v nvidia-smi >/dev/null 2>&1 \
+     && ! ollama ps 2>/dev/null | grep -q "$MODEL_NAME"; then
+    FREE_MIB="$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null \
+                | head -1 | tr -dc '0-9')"
+    if [[ -n "${FREE_MIB:-}" ]] && (( FREE_MIB < 3400 )); then
+      warn "Only ${FREE_MIB} MiB of VRAM free; $MODEL_NAME needs ~3300 to stay fully on the GPU."
+      warn "  Close other GPU apps first, or a turn can take 100s+ with no error."
+      warn "  Verify after the first turn: ollama ps must read 100% GPU."
     fi
-  done
-else
+  fi
+elif [[ -z "${SKIP_OLLAMA:-}" ]]; then
   warn "Ollama is not answering at $OLLAMA_URL - the agent cannot reply."
-  warn "  Start Ollama, then reload the console."
+  warn "  Install it from https://ollama.com/download, then run this again."
 fi
 
 # ----------------------------------------------------------------- serve ----
-mkdir -p "$LOG_DIR"
+# A SERVER ALREADY ON THIS PORT IS A TRAP, not an inconvenience. It caches the
+# prompts and the code it started with, so a stale one answers every request
+# and every check passes against code that is no longer on disk. That has cost
+# a debugging session; uvicorn's own bind error scrolls past in a log file.
+if curl -fsS -m 3 "http://127.0.0.1:$BACKEND_PORT/api/health" >/dev/null 2>&1; then
+  die "Something is already serving on port $BACKEND_PORT, and it is running the
+     code it STARTED with, not the code on disk. Stop it first:
+       Windows:  Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" |
+                   Where-Object { \$_.CommandLine -like '*uvicorn*' } |
+                   ForEach-Object { Stop-Process -Id \$_.ProcessId -Force }
+       Linux:    pkill -f 'uvicorn backend.main:app'
+     Or serve elsewhere:  BACKEND_PORT=9000 ./run.sh"
+fi
+
+if [[ "$BACKEND_HOST" != "127.0.0.1" && "$BACKEND_HOST" != "localhost" ]]; then
+  # Measured: binding 0.0.0.0 does not get you a working console from another
+  # machine. Browsers only allow getUserMedia on localhost or HTTPS, so the
+  # microphone dies on a plain-HTTP LAN origin - port-forward instead:
+  #   ssh -L $BACKEND_PORT:127.0.0.1:$BACKEND_PORT user@host
+  warn "Binding $BACKEND_HOST: the console's microphone will NOT work over plain"
+  warn "  HTTP from another machine (getUserMedia needs localhost or HTTPS)."
+  warn "  Prefer: ssh -L $BACKEND_PORT:127.0.0.1:$BACKEND_PORT user@host"
+  [[ -z "${AUDIO_WS_AUTH_TOKEN:-}" ]] && \
+    warn "  AUDIO_WS_AUTH_TOKEN is unset, so /ws/audio has NO auth on that interface."
+fi
 
 # stdout AND stderr to a file: several real bugs in this project were only ever
 # visible in the server log, and a backgrounded process has no console.
 RELOAD_FLAG=()
 [[ -n "${RELOAD:-}" ]] && RELOAD_FLAG=(--reload)
 
-say "Starting API on port $BACKEND_PORT (log: logs/server.log)"
-"$PY" -m uvicorn backend.main:app --host 127.0.0.1 --port "$BACKEND_PORT" "${RELOAD_FLAG[@]}" \
+say "Starting API on $BACKEND_HOST:$BACKEND_PORT (log: ${LOG_FILE#$ROOT_DIR/})"
+"$PY" -m uvicorn backend.main:app --host "$BACKEND_HOST" --port "$BACKEND_PORT" "${RELOAD_FLAG[@]}" \
   > "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 

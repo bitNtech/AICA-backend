@@ -375,6 +375,54 @@ def test_a_turn_always_ends_even_if_the_vad_never_stops_flagging_speech() -> Non
     assert update.samples is not None and len(update.samples) > 0
 
 
+def test_a_turn_ends_when_the_caller_stops_even_though_the_room_stays_loud() -> None:
+    """The requirement in as many words: the end of MEANINGFUL SPEECH is
+    detected even while background noise continues.
+
+    The watchdog test above covers noise the VAD flags but that is QUIET
+    (echo). This is the other half and the commoner one: a television or a
+    conversation across the room going on at full speaking level after the
+    caller has stopped. Those frames are loud, so if loudness were ever
+    consulted when deciding that a turn has ENDED - the energy gate that was
+    tried here and reverted - the countdown would never complete and the
+    microphone would hang open to the 30 s cap.
+
+    Endpointing is the VAD flag alone, which is exactly what makes this work:
+    loudness may refuse to start a turn, never end one.
+
+    The one case this cannot cover, named so nobody reports it as a bug: noise
+    the VAD flags as speech AND that is loud (a television playing dialogue)
+    is indistinguishable from a caller by every signal available here, and is
+    bounded only by max_utterance_frames (30 s).
+    """
+    settings = AudioSettings()
+    flags = [1] * settings.vad_start_frames + [0] * (settings.endpoint_silence_frames + 1)
+    segmenter = _make_segmenter(flags)
+
+    for _ in range(settings.vad_start_frames):
+        segmenter.process(_frame(SPOKEN))
+    assert segmenter.in_speech
+
+    # The caller has stopped. The ROOM has not - every frame from here is as
+    # loud as speech, and only the VAD flag says otherwise.
+    ended = None
+    for index in range(settings.endpoint_silence_frames + 1):
+        update = segmenter.process(_frame(SPOKEN))
+        if update.speech_ended:
+            ended = (index, update)
+            break
+
+    assert ended is not None, (
+        "the turn never ended while the room was loud - loudness has got into "
+        "the endpoint decision, which is the reverted energy-gate bug"
+    )
+    index, update = ended
+    assert update.end_reason == "silence"
+    assert index < settings.endpoint_silence_frames + 1
+    # And the caller's own audio is intact for the ASR.
+    assert update.samples is not None and len(update.samples) > 0
+
+
 def test_a_caller_who_keeps_talking_never_trips_the_watchdog() -> None:
     """The watchdog must be invisible to anyone actually speaking."""
     settings = AudioSettings()
